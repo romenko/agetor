@@ -7,6 +7,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, DEFAULT_API_HOST, formatHostForUrl, getApiPort, nonLoopbackBindWarning } from "./api-config.ts";
 import { removeCoreCreds } from "./core-creds.ts";
 import {
+  db,
   tasks,
   backlog,
   drafts,
@@ -28,7 +29,7 @@ import {
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, isTaskRunLive, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -381,7 +382,7 @@ function writeAttachmentAtomic(
 // We bind to 127.0.0.1 by default (the headless core can widen it via
 // AGETOR_API_HOST for container use), so CORS is mostly belt-and-suspenders.
 // We still echo the calling origin so the Vite HMR webview
-// (http://localhost:5173) can call us during dev — but never `*`. Foreign
+// (http://localhost:5173 or http://[::1]:5173) can call us during dev — but never `*`. Foreign
 // origins are also blocked by the token gate, so this is defense-in-depth.
 // Populated inside `startApiServer` once the runtime port is known.
 
@@ -1106,6 +1107,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
   ALLOWED_ORIGINS.add(`http://localhost:${PORT}`);
   ALLOWED_ORIGINS.add("http://localhost:5173");
   ALLOWED_ORIGINS.add("http://127.0.0.1:5173");
+  ALLOWED_ORIGINS.add("http://[::1]:5173");
   // Electrobun's bundled `views://` scheme sends Origin: views://<viewName>
   // (not the `null` originally documented here). Without this entry, every
   // packaged-build fetch returns 200 from the server but WebKit rejects the
@@ -4959,9 +4961,22 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               }
             }
           }
-          const updated = tasks.update(req.params.id, patch);
+          const cancelsScheduleForColumnChange =
+            "column" in patch
+            && patch.column !== before.column
+            && patch.column !== "backlog"
+            && patch.column !== "ready";
+          let updated = db.transaction(() => {
+            if (cancelsScheduleForColumnChange) {
+              tasks.schedule.cancelForTaskChange(req.params.id, `task moved to ${patch.column}`);
+            }
+            return tasks.update(req.params.id, patch);
+          })();
           if (!updated) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (cancelsScheduleForColumnChange) {
+            updated = tasks.get(req.params.id) ?? updated;
           }
           // Mirror behavioural changes onto a live claude session via slash
           // commands so the conversation context survives a model/mode/effort
@@ -5026,6 +5041,67 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/schedule": {
+        POST: authed(async (req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const rawBody = await req.json();
+          if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+            return json({ error: "request body must be an object" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = rawBody as { runAt?: unknown; timeZone?: unknown };
+          if (
+            typeof body.runAt !== "number"
+            || !Number.isSafeInteger(body.runAt)
+            || !Number.isFinite(new Date(body.runAt).getTime())
+            || body.runAt <= Date.now()
+          ) {
+            return json(
+              { error: "runAt must be a future Unix timestamp in milliseconds" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (typeof body.timeZone !== "string" || body.timeZone.length > 100) {
+            return json({ error: "timeZone must be an IANA time-zone identifier" }, { status: 400, headers: corsHeaders(req) });
+          }
+          try {
+            new Intl.DateTimeFormat("en-US", { timeZone: body.timeZone }).format(body.runAt);
+          } catch {
+            return json({ error: "timeZone must be a valid IANA time-zone identifier" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (isTaskRunLive(task.id)) {
+            return json({ error: "task is already running or starting" }, { status: 409, headers: corsHeaders(req) });
+          }
+          if (task.pendingInteractionCount > 0) {
+            return json({ error: "task is waiting for an answer and cannot be scheduled" }, { status: 409, headers: corsHeaders(req) });
+          }
+          if (task.fxRecovery?.autoResume) {
+            return json({ error: "task already has an automatic fx resume scheduled" }, { status: 409, headers: corsHeaders(req) });
+          }
+          const schedule = tasks.schedule.set(task.id, body.runAt, body.timeZone);
+          if (!schedule) {
+            return json(
+              { error: "only non-archived backlog/ready tasks without a successful run can be scheduled" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          return json(tasks.get(task.id), { headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const result = tasks.schedule.cancel(task.id);
+          if (result === "too-late") {
+            return json({ error: "scheduled start has already been claimed" }, { status: 409, headers: corsHeaders(req) });
+          }
+          return json(tasks.get(task.id), { headers: corsHeaders(req) });
         }),
       },
 

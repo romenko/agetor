@@ -7,6 +7,7 @@ import { DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { initTaskScheduler, stopTaskScheduler } from "./task-scheduler.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
@@ -435,6 +436,10 @@ writeCoreCreds(
   },
   dataDir,
 );
+const rearmedTaskSchedules = initTaskScheduler();
+if (rearmedTaskSchedules > 0) {
+  console.log(`[agetor] re-armed ${rearmedTaskSchedules} interrupted task schedule(s)`);
+}
 
 // Warn the user before quitting when runs are still active. Electrobun's
 // `before-quit` event fires synchronously from Utils.quit() and reads
@@ -499,6 +504,7 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
 // about letting the process exit at all; it touches no persisted
 // `fxRecovery` row — `rearmFxAutoResumes()` re-arms from the DB on next boot.
 process.on("exit", stopFxAutoResumeTimers);
+process.on("exit", stopTaskScheduler);
 
 // Background self-update check on launch + every 6h. Emits global events
 // that the UI subscribes to via SSE to render the "update ready" banner.

@@ -1698,6 +1698,8 @@ export interface Task {
    * default kanban filter and rendered read-only in the run panel.
    */
   archivedAt: number | null;
+  /** Server-managed one-shot start schedule. Absent on older clients and fixtures. */
+  schedule?: TaskSchedule | null;
   /** Count of this task's subagents currently `status:"running"`. Derived per
    *  request by the server (never persisted, never patchable). Absent on payloads
    *  that don't join the subagents table. */
@@ -1715,6 +1717,15 @@ export interface Task {
    * stalled.
    */
   stalledSince?: number | null;
+}
+
+export interface TaskSchedule {
+  runAt: number;
+  timeZone: string;
+  status: "scheduled" | "claimed" | "started" | "cancelled" | "failed" | "skipped";
+  runId: string | null;
+  error: string | null;
+  updatedAt: number;
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can

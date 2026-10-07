@@ -1,8 +1,9 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
-import { db, dataDir, subagents } from "./db.ts";
+import { db, dataDir, subagents, tasks } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { initTaskScheduler, stopTaskScheduler } from "./task-scheduler.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -77,6 +78,11 @@ function hasRunningRuns(): boolean {
 export function hasRunningWork(): boolean {
   if (hasRunningRuns()) return true;
   try {
+    if (tasks.schedule.hasPending()) return true;
+  } catch {
+    // A scheduler-state read failure must not crash the daemon's idle loop.
+  }
+  try {
     return subagents.hasAnyRunning(Date.now() - SUBAGENT_HOLD_MAX_MS);
   } catch (err) {
     if (!loggedHasRunningWorkError) {
@@ -111,6 +117,7 @@ function shutdown(reason: string, code = 0): void {
   // not touch any persisted `fxRecovery` row — `rearmFxAutoResumes()` re-arms
   // them from the DB on the next boot.
   stopFxAutoResumeTimers();
+  stopTaskScheduler();
   try {
     removeCoreCreds(dataDir);
   } catch {
@@ -252,6 +259,10 @@ export async function runDaemon(): Promise<void> {
     },
     dataDir,
   );
+  const rearmedTaskSchedules = initTaskScheduler();
+  if (rearmedTaskSchedules > 0) {
+    daemonLog(`re-armed ${rearmedTaskSchedules} interrupted task schedule(s)`);
+  }
   // A non-loopback bind's warning is printed once by startApiServer, to
   // stderr — which `spawnDaemon` points at this same daemon.log.
   daemonLog(`cli-daemon listening on http://${formatHostForUrl(apiHost.host)}:${server.port}`);

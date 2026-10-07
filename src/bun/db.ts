@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskSchedule, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -123,6 +123,12 @@ type TaskRow = {
   pipeline_run: string | null;
   pipeline_parent_id: string | null;
   pipeline_step_id: string | null;
+  schedule_run_at: number | null;
+  schedule_time_zone: string | null;
+  schedule_status: string | null;
+  schedule_run_id: string | null;
+  schedule_error: string | null;
+  schedule_updated_at: number | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -799,6 +805,14 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
+  schedule: r.schedule_status ? {
+    runAt: r.schedule_run_at ?? 0,
+    timeZone: r.schedule_time_zone ?? "UTC",
+    status: r.schedule_status as TaskSchedule["status"],
+    runId: r.schedule_run_id,
+    error: r.schedule_error,
+    updatedAt: r.schedule_updated_at ?? 0,
+  } : null,
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -806,9 +820,16 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
 // exists for the task, 0 otherwise (NULL coalesces to 0 via COALESCE).
 const TASKS_SELECT = `
   SELECT tasks.*,
-         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run
+         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run,
+         task_schedules.run_at AS schedule_run_at,
+         task_schedules.time_zone AS schedule_time_zone,
+         task_schedules.status AS schedule_status,
+         task_schedules.run_id AS schedule_run_id,
+         task_schedules.error AS schedule_error,
+         task_schedules.updated_at AS schedule_updated_at
     FROM tasks
     LEFT JOIN runs ON runs.task_id = tasks.id
+    LEFT JOIN task_schedules ON task_schedules.task_id = tasks.id
 `;
 
 export const tasks = {
@@ -981,6 +1002,197 @@ export const tasks = {
   },
   delete(id: string) {
     db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  },
+  schedule: {
+    get(taskId: string): TaskSchedule | null {
+      const row = db.query<{
+        run_at: number;
+        time_zone: string;
+        status: string;
+        run_id: string | null;
+        error: string | null;
+        updated_at: number;
+      }, [string]>(
+        `SELECT run_at, time_zone, status, run_id, error, updated_at
+           FROM task_schedules WHERE task_id = ?`,
+      ).get(taskId);
+      return row ? {
+        runAt: row.run_at,
+        timeZone: row.time_zone,
+        status: row.status as TaskSchedule["status"],
+        runId: row.run_id,
+        error: row.error,
+        updatedAt: row.updated_at,
+      } : null;
+    },
+    set(taskId: string, runAt: number, timeZone: string): TaskSchedule | null {
+      const now = Date.now();
+      const revision = randomUUID();
+      const write = db.transaction(() => {
+        const task = db.query<{
+          column: string;
+          archived_at: number | null;
+          pipeline_id: string | null;
+          pipeline_parent_id: string | null;
+        }, [string]>(
+          `SELECT column, archived_at, pipeline_id, pipeline_parent_id
+             FROM tasks WHERE id = ?`,
+        ).get(taskId);
+        if (
+          !task
+          || task.archived_at != null
+          || task.pipeline_id != null
+          || task.pipeline_parent_id != null
+          || (task.column !== "backlog" && task.column !== "ready")
+          || db.query<{ one: number }, [string]>(
+            `SELECT 1 AS one FROM runs
+              WHERE task_id = ? AND status NOT IN ('failed', 'cancelled')
+              LIMIT 1`,
+          ).get(taskId)
+        ) return false;
+        const current = db.query<{ status: string }, [string]>(
+          `SELECT status FROM task_schedules WHERE task_id = ?`,
+        ).get(taskId);
+        if (current?.status === "claimed") return false;
+        db.run(
+          `INSERT INTO task_schedules
+             (task_id, run_at, time_zone, status, revision, claim_id, run_id, error, updated_at)
+           VALUES (?, ?, ?, 'scheduled', ?, NULL, NULL, NULL, ?)
+           ON CONFLICT(task_id) DO UPDATE SET
+             run_at = excluded.run_at,
+             time_zone = excluded.time_zone,
+             status = 'scheduled',
+             revision = excluded.revision,
+             claim_id = NULL,
+             run_id = NULL,
+             error = NULL,
+             updated_at = excluded.updated_at`,
+          [taskId, runAt, timeZone, revision, now],
+        );
+        return true;
+      });
+      return write() ? this.get(taskId) : null;
+    },
+    cancel(taskId: string): "cancelled" | "too-late" | "missing" {
+      const row = db.query<{ status: string }, [string]>(
+        `SELECT status FROM task_schedules WHERE task_id = ?`,
+      ).get(taskId);
+      if (!row || row.status === "cancelled" || row.status === "failed" || row.status === "skipped") {
+        return "missing";
+      }
+      if (row.status !== "scheduled") return "too-late";
+      db.run(
+        `UPDATE task_schedules
+            SET status = 'cancelled', claim_id = NULL, updated_at = ?
+          WHERE task_id = ? AND status = 'scheduled'`,
+        [Date.now(), taskId],
+      );
+      return "cancelled";
+    },
+    cancelForTaskChange(taskId: string, reason: string): void {
+      db.run(
+        `UPDATE task_schedules
+            SET status = 'skipped', claim_id = NULL, error = ?, updated_at = ?
+          WHERE task_id = ? AND status IN ('scheduled', 'claimed')`,
+        [reason, Date.now(), taskId],
+      );
+    },
+    cancelForManualStart(taskId: string): void {
+      db.run(
+        `UPDATE task_schedules
+            SET status = 'cancelled', claim_id = NULL, error = 'cancelled by manual start', updated_at = ?
+          WHERE task_id = ? AND status IN ('scheduled', 'claimed')`,
+        [Date.now(), taskId],
+      );
+    },
+    claimDue(now: number, claimId: string): Array<{ taskId: string; runAt: number; revision: string }> {
+      const claim = db.transaction(() => {
+        const rows = db.query<{
+          task_id: string;
+          run_at: number;
+          revision: string;
+        }, [number]>(
+          `SELECT s.task_id, s.run_at, s.revision
+             FROM task_schedules s
+             JOIN tasks t ON t.id = s.task_id
+            WHERE s.status = 'scheduled' AND s.run_at <= ?
+              AND t.archived_at IS NULL
+              AND t.column IN ('backlog', 'ready')
+              AND t.pipeline_id IS NULL AND t.pipeline_parent_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM runs r WHERE r.task_id = t.id
+                  AND r.status NOT IN ('failed', 'cancelled')
+              )
+            ORDER BY s.run_at ASC, s.task_id ASC
+            LIMIT 10`,
+        ).all(now);
+        const claimed: Array<{ taskId: string; runAt: number; revision: string }> = [];
+        for (const row of rows) {
+          const result = db.run(
+            `UPDATE task_schedules SET status = 'claimed', claim_id = ?, updated_at = ?
+              WHERE task_id = ? AND status = 'scheduled' AND revision = ?
+                AND EXISTS (
+                  SELECT 1 FROM tasks t WHERE t.id = task_schedules.task_id
+                    AND t.archived_at IS NULL AND t.column IN ('backlog', 'ready')
+                    AND t.pipeline_id IS NULL AND t.pipeline_parent_id IS NULL
+                    AND NOT EXISTS (
+                      SELECT 1 FROM runs r WHERE r.task_id = t.id
+                        AND r.status NOT IN ('failed', 'cancelled')
+                    )
+                )`,
+            [claimId, now, row.task_id, row.revision],
+          );
+          if (result.changes > 0) claimed.push({ taskId: row.task_id, runAt: row.run_at, revision: row.revision });
+        }
+        return claimed;
+      });
+      return claim();
+    },
+    ownsClaim(taskId: string, claimId: string): boolean {
+      return db.query<{ one: number }, [string, string]>(
+        `SELECT 1 AS one FROM task_schedules
+          WHERE task_id = ? AND status = 'claimed' AND claim_id = ?`,
+      ).get(taskId, claimId) != null;
+    },
+    complete(taskId: string, claimId: string, runId: string): void {
+      db.run(
+        `UPDATE task_schedules
+            SET status = 'started', run_id = ?, claim_id = NULL, error = NULL, updated_at = ?
+          WHERE task_id = ? AND status = 'claimed' AND claim_id = ?`,
+        [runId, Date.now(), taskId, claimId],
+      );
+    },
+    fail(taskId: string, claimId: string, error: string): void {
+      db.run(
+        `UPDATE task_schedules
+            SET status = 'failed', claim_id = NULL, error = ?, updated_at = ?
+          WHERE task_id = ? AND status = 'claimed' AND claim_id = ?`,
+        [error.slice(0, 2000), Date.now(), taskId, claimId],
+      );
+    },
+    skip(taskId: string, claimId: string, reason: string): void {
+      db.run(
+        `UPDATE task_schedules
+            SET status = 'skipped', claim_id = NULL, error = ?, updated_at = ?
+          WHERE task_id = ? AND status = 'claimed' AND claim_id = ?`,
+        [reason, Date.now(), taskId, claimId],
+      );
+    },
+    rearmClaimed(): number {
+      const result = db.run(
+        `UPDATE task_schedules
+            SET status = 'scheduled', claim_id = NULL, updated_at = ?
+          WHERE status = 'claimed' AND run_id IS NULL`,
+        [Date.now()],
+      );
+      return result.changes;
+    },
+    hasPending(): boolean {
+      return db.query<{ one: number }, []>(
+        `SELECT 1 AS one FROM task_schedules
+          WHERE status IN ('scheduled', 'claimed') LIMIT 1`,
+      ).get() != null;
+    },
   },
   /**
    * Mark a task's unread watermark caught-up-to-date: `last_seen_event_id`

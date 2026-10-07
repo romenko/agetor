@@ -122,6 +122,16 @@ export const USAGE: Record<string, string> = {
 
   Move a task between columns (mark done = move <id> done).`,
 
+  schedule: `usage: agetor schedule <task-id> <ISO-8601> [--timezone <IANA>]
+
+  Schedule a one-time start for a backlog/ready task. The date must include Z
+  or an explicit UTC offset; the optional timezone controls how it is displayed.
+  Example: agetor schedule <id> 2026-10-08T09:30:00+03:00 --timezone Europe/Kiev`,
+
+  unschedule: `usage: agetor unschedule <task-id>
+
+  Cancel a pending scheduled start. Use 'agetor start <id>' to run it now.`,
+
   archive: `usage: agetor archive <task-id>
 
   Archive a done task (unarchive <id> to restore).`,

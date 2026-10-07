@@ -9,6 +9,32 @@ import { flagValue } from "../args.ts";
 import { usageError } from "../usage.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
+const SCHEDULED_ISO_RE =
+  /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d)(?:\.\d{1,3})?)?(Z|[+-](?:0\d|1\d|2[0-3]):[0-5]\d)$/i;
+
+export function parseScheduledIsoDate(value: string): number {
+  const match = SCHEDULED_ISO_RE.exec(value);
+  if (!match) {
+    throw new Error("scheduled time must be ISO-8601 with a valid date, time, and explicit UTC offset");
+  }
+  const [, yearText, monthText, dayText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const calendarDate = new Date(Date.UTC(year, month - 1, day));
+  if (
+    calendarDate.getUTCFullYear() !== year
+    || calendarDate.getUTCMonth() !== month - 1
+    || calendarDate.getUTCDate() !== day
+  ) {
+    throw new Error(`invalid ISO-8601 date: ${value}`);
+  }
+  const runAt = Date.parse(value);
+  if (!Number.isSafeInteger(runAt) || !Number.isFinite(runAt)) {
+    throw new Error(`invalid ISO-8601 date: ${value}`);
+  }
+  return runAt;
+}
 
 export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -95,6 +121,49 @@ export async function cmdMove(args: string[], flags: Flags): Promise<void> {
   const updated = await client.patchTask(task.id, { column });
   if (flags.json) return printJson(updated);
   out(`${c.cyan("→")} moved ${c.dim(updated.id.slice(0, 8))} → ${column}`);
+}
+
+export async function cmdSchedule(args: string[], flags: Flags): Promise<void> {
+  const ref = args[0];
+  const isoDate = args[1];
+  if (!ref || !isoDate) throw usageError("schedule");
+  let timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] !== "--timezone" || !args[i + 1]) {
+      throw usageError("schedule");
+    }
+    timeZone = args[++i]!;
+  }
+  const runAt = parseScheduledIsoDate(isoDate);
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format(runAt);
+  } catch {
+    throw new Error(`invalid IANA time zone: ${timeZone}`);
+  }
+  const client = await getClient(flags);
+  const task = await resolveTask(client, ref);
+  const updated = await client.scheduleTask(task.id, runAt, timeZone);
+  if (flags.json) return printJson(updated);
+  const scheduledLabel = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone,
+  }).format(runAt);
+  out(`${c.green("✓")} scheduled ${c.dim(updated.id.slice(0, 8))} — ${scheduledLabel} (${timeZone})`);
+}
+
+export async function cmdUnschedule(args: string[], flags: Flags): Promise<void> {
+  const ref = args[0];
+  if (!ref) throw usageError("unschedule");
+  const client = await getClient(flags);
+  const task = await resolveTask(client, ref);
+  const updated = await client.cancelTaskSchedule(task.id);
+  if (flags.json) return printJson(updated);
+  out(
+    updated.schedule?.status === "cancelled"
+      ? `${c.gray("cancelled schedule")} ${c.dim(updated.id.slice(0, 8))}`
+      : `${c.dim("no active schedule")} ${c.dim(updated.id.slice(0, 8))}`,
+  );
 }
 
 export async function cmdArchive(args: string[], flags: Flags): Promise<void> {

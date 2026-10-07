@@ -1,10 +1,12 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CalendarClock, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2, X } from "lucide-react";
+import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { api } from "@/lib/api";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { AWAITING_RING_CLASS, awaitingLabel as awaitingLabelFor } from "@/lib/awaiting";
 import { AwaitingGlow } from "@/components/ui/awaiting-glow";
@@ -13,6 +15,7 @@ import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-au
 import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
+import { scheduleDateLabel } from "@/lib/task-schedule";
 import { AgentIcon } from "./AgentIcon";
 import { PipelineBadge } from "@/components/pipelines";
 
@@ -278,6 +281,49 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
         <CardTitle className="text-sm break-words">{task.title}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-2">
+        {task.schedule && ["scheduled", "claimed", "failed"].includes(task.schedule.status) && (
+          <div className="flex min-w-0 items-start gap-1.5">
+            <div
+              className={cn(
+                "flex min-w-0 flex-1 items-start gap-1.5 text-[11px]",
+                task.schedule.status === "failed" ? "text-destructive" : "text-info",
+              )}
+              data-testid="task-card-schedule"
+              title={task.schedule.error ?? undefined}
+            >
+              <CalendarClock className="mt-0.5 size-3.5 shrink-0" />
+              <span className="min-w-0 break-words">
+                {task.schedule.status === "claimed"
+                  ? "Starting scheduled run"
+                  : task.schedule.status === "failed"
+                    ? `Scheduled run failed · ${scheduleDateLabel(task.schedule)}`
+                    : `Scheduled · ${scheduleDateLabel(task.schedule)}`}
+              </span>
+            </div>
+            {task.schedule.status === "scheduled" && (
+              <Button
+                size="icon"
+                variant="ghost"
+                className="size-6 shrink-0"
+                aria-label="Cancel scheduled run"
+                title="Cancel scheduled run"
+                data-testid="task-card-schedule-cancel"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void api.cancelTaskSchedule(task.id)
+                    .then(() => toast.success("Schedule cancelled"))
+                    .catch((error: unknown) => {
+                      toast.error("Couldn't cancel schedule", {
+                        description: error instanceof Error ? error.message : String(error),
+                      });
+                    });
+                }}
+              >
+                <X className="size-3" />
+              </Button>
+            )}
+          </div>
+        )}
         <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
         <p
           className="text-[10px] text-muted-foreground/70 font-mono truncate"

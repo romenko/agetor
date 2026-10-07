@@ -33,6 +33,17 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
       `   ${label("model")} ${escapeControlChars(task.model ?? "-")}   ${label("mode")} ${escapeControlChars(modeText)}`,
   );
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
+  if (task.schedule && ["scheduled", "claimed", "failed"].includes(task.schedule.status)) {
+    const when = new Intl.DateTimeFormat(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone: task.schedule.timeZone,
+    }).format(task.schedule.runAt);
+    out(
+      `  ${label("schedule")} ${task.schedule.status === "claimed" ? "starting" : task.schedule.status === "failed" ? "failed" : when}`,
+    );
+    if (task.schedule.error) out(`    ${c.dim(task.schedule.error)}`);
+  }
   if (task.branch) out(`  ${label("branch")} ${task.branch}`);
   if (task.issueUrl) out(`  ${label("issue")} ${task.issueUrl}`);
   if (task.agentProfile) {

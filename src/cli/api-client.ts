@@ -159,6 +159,12 @@ export class AgetorClient {
   ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true }> {
     return this.req("POST", `/tasks/${id}/start`, undefined, START_TIMEOUT_MS);
   }
+  scheduleTask(id: string, runAt: number, timeZone: string): Promise<Task> {
+    return this.req("POST", `/tasks/${encodeURIComponent(id)}/schedule`, { runAt, timeZone });
+  }
+  cancelTaskSchedule(id: string): Promise<Task> {
+    return this.req("DELETE", `/tasks/${encodeURIComponent(id)}/schedule`);
+  }
   archiveTask(id: string): Promise<Task> {
     return this.req("POST", `/tasks/${id}/archive`);
   }

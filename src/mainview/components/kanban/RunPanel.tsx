@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, CalendarClock, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Play, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
@@ -101,6 +101,7 @@ import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
+import { localScheduleTimestamp, localTimeZone, scheduleDateLabel, scheduleDateTimeInputValue } from "@/lib/task-schedule";
 import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
 import { isHandoffReminderMarker } from "../../../shared/pipeline.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
@@ -6792,6 +6793,10 @@ function TaskDetails({
   // Spins the Model row's ↻ button while a manual `onRefreshModels` probe is
   // in flight for this task's harness — mirrors NewTaskForm's affordance.
   const [refreshingModels, setRefreshingModels] = useState(false);
+  const [scheduleDraft, setScheduleDraft] = useState(() =>
+    scheduleDateTimeInputValue(Date.now() + 5 * 60_000),
+  );
+  const [scheduleBusy, setScheduleBusy] = useState(false);
   // A task bound to an agent profile (plan D5) locks the four dropdowns
   // (+ cursor fast/max) regardless of run state — only Detach unlocks them.
   // `runningLock` alone (the pre-existing rule) still gates the Detach
@@ -6808,6 +6813,72 @@ function TaskDetails({
   useEffect(() => {
     if (profileDialogOpen && !profileLock) setProfileDialogOpen(false);
   }, [profileDialogOpen, profileLock]);
+  useEffect(() => {
+    if (task.schedule?.runAt) {
+      setScheduleDraft(scheduleDateTimeInputValue(task.schedule.runAt));
+    }
+  }, [task.schedule?.runAt, task.schedule?.updatedAt]);
+  const canScheduleTask =
+    task.archivedAt == null
+    && (task.column === "backlog" || task.column === "ready")
+    && task.pipelineId == null
+    && task.pipelineParentId == null
+    && task.pendingInteractionCount === 0
+    && !task.fxRecovery?.autoResume
+    && task.runId == null;
+  const schedulePending = task.schedule?.status === "scheduled" || task.schedule?.status === "claimed";
+  const saveSchedule = async () => {
+    const runAt = localScheduleTimestamp(scheduleDraft);
+    if (runAt == null || runAt <= Date.now()) {
+      toast.error("Choose a future date and time");
+      return;
+    }
+    setScheduleBusy(true);
+    try {
+      const updated = await api.scheduleTask(task.id, runAt, localTimeZone());
+      onTaskFieldsChanged?.(task.id, { schedule: updated.schedule });
+      toast.success("Task scheduled");
+    } catch (error) {
+      toast.error("Couldn't schedule task", {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setScheduleBusy(false);
+    }
+  };
+  const cancelSchedule = async () => {
+    setScheduleBusy(true);
+    try {
+      const updated = await api.cancelTaskSchedule(task.id);
+      onTaskFieldsChanged?.(task.id, { schedule: updated.schedule });
+      toast.success("Schedule cancelled");
+    } catch (error) {
+      toast.error("Couldn't cancel schedule", {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setScheduleBusy(false);
+    }
+  };
+  const startScheduledTaskNow = async () => {
+    setScheduleBusy(true);
+    try {
+      const result = await api.startTask(task.id);
+      onTaskFieldsChanged?.(task.id, {
+        column: "running",
+        runId: result.runId,
+        schedule: task.schedule?.status === "scheduled" || task.schedule?.status === "claimed"
+          ? { ...task.schedule, status: "cancelled", error: "cancelled by manual start", updatedAt: Date.now() }
+          : task.schedule,
+      });
+    } catch (error) {
+      toast.error("Couldn't start task", {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setScheduleBusy(false);
+    }
+  };
   const detachProfile = async () => {
     setDetaching(true);
     try {
@@ -7031,6 +7102,72 @@ function TaskDetails({
 
   return (
     <>
+      {canScheduleTask && (
+        <section className="border-b border-border/60 px-3 py-2" data-testid="task-schedule-controls">
+          <div className="mb-2 flex items-center gap-1.5 text-xs font-medium">
+            <CalendarClock className="size-3.5 text-info" />
+            <span>Scheduled run</span>
+            {task.schedule?.status === "claimed" && (
+              <Badge variant="outline" className="ml-auto text-[10px] text-info">Starting</Badge>
+            )}
+          </div>
+          {schedulePending && task.schedule && (
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              {task.schedule.status === "claimed" ? "Starting now" : `Scheduled for ${scheduleDateLabel(task.schedule)}`}
+            </p>
+          )}
+          {task.schedule?.status === "failed" && task.schedule.error && (
+            <p className="mb-2 text-[11px] text-destructive" title={task.schedule.error}>
+              Previous scheduled start failed: {task.schedule.error}
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Input
+              aria-label="Scheduled run date and time"
+              data-testid="task-schedule-datetime"
+              type="datetime-local"
+              value={scheduleDraft}
+              min={scheduleDateTimeInputValue(Date.now() + 60_000)}
+              onChange={(event) => setScheduleDraft(event.target.value)}
+              disabled={scheduleBusy || task.schedule?.status === "claimed"}
+              className="h-8 min-w-[12rem] flex-1 text-xs"
+            />
+            <Button
+              size="sm"
+              variant={schedulePending ? "outline" : "secondary"}
+              data-testid="task-schedule-save"
+              disabled={scheduleBusy || task.schedule?.status === "claimed"}
+              onClick={() => void saveSchedule()}
+            >
+              <CalendarClock className="size-3" />
+              {schedulePending ? "Reschedule" : "Schedule"}
+            </Button>
+            {schedulePending && task.schedule?.status === "scheduled" && (
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="Cancel scheduled run"
+                title="Cancel scheduled run"
+                data-testid="task-schedule-cancel"
+                disabled={scheduleBusy}
+                onClick={() => void cancelSchedule()}
+                className="size-8"
+              >
+                <X className="size-3.5" />
+              </Button>
+            )}
+            <Button
+              size="sm"
+              onClick={() => void startScheduledTaskNow()}
+              disabled={scheduleBusy}
+              data-testid="task-schedule-run-now"
+            >
+              <Play className="size-3" />
+              Run now
+            </Button>
+          </div>
+        </section>
+      )}
       <details className="border-b border-border/60 px-3 py-2 text-xs">
         <summary className="cursor-pointer text-muted-foreground">
           <span className="text-[10px] uppercase tracking-wide">Task details</span>

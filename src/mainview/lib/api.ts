@@ -1462,6 +1462,13 @@ export const api = {
   // `pending: true` (optional): the server returned before the agent spawn
   // finished; the run row already exists (task-details-blank-while-session-restores.md §3.1).
   startTask: (id: string) => j<{ runId: string; pending?: true }>(`/tasks/${id}/start`, { method: "POST" }),
+  scheduleTask: (id: string, runAt: number, timeZone: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(id)}/schedule`, {
+      method: "POST",
+      body: JSON.stringify({ runAt, timeZone }),
+    }, { retry: false }),
+  cancelTaskSchedule: (id: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(id)}/schedule`, { method: "DELETE" }, { retry: false }),
   /** `force: true` bypasses the done-column gate (still rejects an active
    *  run) — used by the Worktrees page's "Archive & delete" flow to archive
    *  a stale worktree's task regardless of its current column. `stopRun:

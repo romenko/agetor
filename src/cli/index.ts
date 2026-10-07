@@ -13,7 +13,7 @@ import { cmdAnswer } from "./commands/answer.ts";
 import { cmdResume } from "./commands/resume.ts";
 import { cmdLogs } from "./commands/logs.ts";
 import { cmdFiles } from "./commands/files.ts";
-import { cmdEdit, cmdMove, cmdArchive, cmdUnarchive } from "./commands/manage.ts";
+import { cmdEdit, cmdMove, cmdSchedule, cmdUnschedule, cmdArchive, cmdUnarchive } from "./commands/manage.ts";
 import { cmdDiff } from "./commands/diff.ts";
 import { cmdAttach } from "./commands/attach.ts";
 import { cmdHarness } from "./commands/harness.ts";
@@ -40,6 +40,8 @@ Commands:
   show <id>           task details, runs, pending interactions
   edit <id> [flags]   change title/prompt/agent/workdir/model/mode/effort/type/column
   move <id> <column>  move a task between columns (mark done = move <id> done)
+  schedule <id> <ISO-8601> [--timezone <IANA>]  schedule a one-time task start
+  unschedule <id>     cancel a pending scheduled start
   start <id>          run a not-yet-run task
   send <id> <msg…>    message a task (--ref <path> attaches files/images)
   commit <id>         ask the agent to commit all changes & push the branch
@@ -182,6 +184,10 @@ async function main(): Promise<void> {
     case "move":
     case "mv":
       return cmdMove(args, flags);
+    case "schedule":
+      return cmdSchedule(args, flags);
+    case "unschedule":
+      return cmdUnschedule(args, flags);
     case "archive":
       return cmdArchive(args, flags);
     case "unarchive":

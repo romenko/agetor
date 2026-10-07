@@ -1,10 +1,35 @@
 import { test, expect } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ensureCore, stopDaemon } from "./daemon/supervisor.ts";
 import { AgetorClient, ApiError, discoverCore } from "./api-client.ts";
 import { coreCredsPath } from "../bun/core-creds.ts";
+import { makeTask } from "./test-fixtures.ts";
+
+test("schedule methods encode task IDs and preserve request bodies", async () => {
+  const captured: unknown[] = [];
+  const task = makeTask({ id: "t 1" });
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (req) => {
+      captured.push([req.method, new URL(req.url).pathname, await req.text()]);
+      return Response.json(task);
+    },
+  });
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    expect(await client.scheduleTask("t 1", 123, "UTC")).toEqual(task);
+    expect(await client.cancelTaskSchedule("t 1")).toEqual(task);
+    expect(captured).toEqual([
+      ["POST", "/tasks/t%201/schedule", JSON.stringify({ runAt: 123, timeZone: "UTC" })],
+      ["DELETE", "/tasks/t%201/schedule", ""],
+    ]);
+  } finally {
+    server.stop(true);
+  }
+});
 
 test("discoverCore returns null when no core is running", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-disc-"));
@@ -47,6 +72,61 @@ test("api-client task round-trip + ApiError on 404", async () => {
     for (let i = 0; i < 30 && existsSync(coreCredsPath(dir)); i++) {
       await Bun.sleep(100);
     }
+  }
+}, 30_000);
+
+test("a restarted headless core re-arms an interrupted schedule and starts it once", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-schedule-restart-"));
+  const previousDriver = process.env.AGETOR_CLAUDE_DRIVER;
+  const previousBin = process.env.AGETOR_CLAUDE_BIN;
+  const previousTmux = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_CLAUDE_DRIVER = "fake";
+  process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
+  process.env.AGETOR_TMUX_BIN = "/bin/echo";
+  try {
+    const firstCore = await ensureCore({ dataDir: dir, port: 4499 });
+    const firstClient = new AgetorClient(firstCore);
+    const task = await firstClient.createTask({
+      title: "restart scheduled task",
+      prompt: "p",
+      agent: "claude-code",
+      isolation: "none",
+      workdir: dir,
+    });
+    await firstClient.scheduleTask(task.id, Date.now() + 60_000, "UTC");
+    await stopDaemon(dir);
+    for (let i = 0; i < 30 && existsSync(coreCredsPath(dir)); i++) await Bun.sleep(100);
+
+    const db = new Database(path.join(dir, "agetor.sqlite"));
+    try {
+      db.run(
+        `UPDATE task_schedules
+            SET run_at = ?, status = 'claimed', claim_id = 'interrupted', run_id = NULL
+          WHERE task_id = ?`,
+        [Date.now() - 60_000, task.id],
+      );
+    } finally {
+      db.close();
+    }
+
+    const restartedCore = await ensureCore({ dataDir: dir, port: 4499 });
+    const restartedClient = new AgetorClient(restartedCore);
+    let current = await restartedClient.getTask(task.id);
+    for (let i = 0; i < 100 && current.schedule?.status !== "started"; i++) {
+      await Bun.sleep(50);
+      current = await restartedClient.getTask(task.id);
+    }
+    expect(current.schedule).toMatchObject({ status: "started" });
+    const runs = await restartedClient.getRuns(task.id);
+    expect(runs).toHaveLength(1);
+  } finally {
+    await stopDaemon(dir);
+    if (previousDriver === undefined) delete process.env.AGETOR_CLAUDE_DRIVER;
+    else process.env.AGETOR_CLAUDE_DRIVER = previousDriver;
+    if (previousBin === undefined) delete process.env.AGETOR_CLAUDE_BIN;
+    else process.env.AGETOR_CLAUDE_BIN = previousBin;
+    if (previousTmux === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = previousTmux;
   }
 }, 30_000);
 

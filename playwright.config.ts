@@ -30,7 +30,11 @@ import { defineConfig, devices } from "@playwright/test";
  * per-worker fixture.
  */
 export const E2E_VITE_PORT = 5173;
-export const E2E_BASE_URL = `http://localhost:${E2E_VITE_PORT}`;
+const E2E_VITE_HOST = process.env.E2E_VITE_HOST ?? "localhost";
+const E2E_VITE_URL_HOST = E2E_VITE_HOST.includes(":")
+  ? `[${E2E_VITE_HOST}]`
+  : E2E_VITE_HOST;
+export const E2E_BASE_URL = `http://${E2E_VITE_URL_HOST}:${E2E_VITE_PORT}`;
 
 export default defineConfig({
   testDir: "e2e",
@@ -50,7 +54,7 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    command: "bun run hmr",
+    command: `bun run hmr -- --host ${E2E_VITE_HOST}`,
     url: E2E_BASE_URL,
     timeout: 60_000,
     reuseExistingServer: !process.env.CI,

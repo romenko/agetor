@@ -1334,18 +1334,35 @@ export function isTaskRunCancelling(taskId: string): boolean {
  */
 export async function startTask(
   taskId: string,
+  opts: { scheduleClaimId?: string } = {},
 ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
+  if (opts.scheduleClaimId && !tasks.schedule.ownsClaim(taskId, opts.scheduleClaimId)) {
+    return { error: "scheduled start was cancelled or superseded" };
+  }
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
   if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
+  if (!opts.scheduleClaimId) tasks.schedule.cancelForManualStart(taskId);
   startingTaskIds.add(taskId);
-  return startTaskInner(taskId, task);
+  try {
+    const result = await startTaskInner(taskId, task, opts.scheduleClaimId);
+    if ("error" in result && opts.scheduleClaimId) {
+      tasks.schedule.fail(taskId, opts.scheduleClaimId, result.error);
+    }
+    return result;
+  } catch (error) {
+    if (opts.scheduleClaimId) {
+      tasks.schedule.fail(taskId, opts.scheduleClaimId, (error as Error)?.message ?? String(error));
+    }
+    throw error;
+  }
 }
 
 async function startTaskInner(
   taskId: string,
   task: Task,
+  scheduleClaimId?: string,
 ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
   // Whether ownership of releasing the `startingTaskIds` claim (added by
   // `startTask` above) has been handed off to the detached spawn
@@ -1589,6 +1606,9 @@ async function startTaskInner(
   const runId = randomUUID();
   const now = Date.now();
   const prevColumn: ColumnId = task.column;
+  if (scheduleClaimId && !tasks.schedule.ownsClaim(taskId, scheduleClaimId)) {
+    return { error: "scheduled start was cancelled before launch" };
+  }
 
   // Single transaction: flip the task into running with the new run id, branch,
   // worktree path; insert the run row. Either everything sticks or nothing does.
@@ -1624,6 +1644,7 @@ async function startTaskInner(
       fxSessionId: null,
       antigravitySessionId: null,
     });
+    if (scheduleClaimId) tasks.schedule.complete(taskId, scheduleClaimId, runId);
   });
   persist();
   if (prevColumn !== "running") {
@@ -3270,6 +3291,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
 
   const task = tasks.get(row.task_id);
   if (!task) return { delivered: false, reason: "task not found" };
+  tasks.schedule.cancelForManualStart(row.task_id);
 
   // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
   // below — the archivedAt clear and the worktree restore both mutate state,
@@ -5054,6 +5076,7 @@ export async function resumeFxRecovery(
 
     const origin = opts?.origin ?? "manual";
     if (origin === "manual") {
+      tasks.schedule.cancelForManualStart(taskId);
       // The user acting is an implicit cancel of any pending auto-resume
       // schedule — see this function's doc. No status line: `spawnFxRun`'s
       // own `continueRecovery` row lifecycle (below) already leaves the row
@@ -6492,7 +6515,10 @@ export async function archiveTask(
     }
     return { task };
   }
-  const updated = tasks.update(taskId, { archivedAt: Date.now() });
+  const updated = db.transaction(() => {
+    tasks.schedule.cancelForTaskChange(taskId, "task archived");
+    return tasks.update(taskId, { archivedAt: Date.now() });
+  })();
   if (!updated) return { error: "task not found" };
   // Pipeline parent (D9, docs/plans/pipelines.md): archive every non-archived
   // step task first — `cascadePipelineArchive` is best-effort per step (a
